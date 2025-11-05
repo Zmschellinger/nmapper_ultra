@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 nmapper_ultra.py
+Usage examples:
+  # Default (staged, aggressive included without -O):
+  python3 nmapPyDumpPlus_with_scanner.py --targets-file targets.txt --outputDir ./pyDumpOutput
 
-Enhancements requested by user:
-- Removed --authorized flag earlier.
-- Live-update is default and append-only.
-- Added --rebuild to force a full rebuild from XMLs/state.json.
-- Added a simple dashboard: the script writes a static dashboard.html into the output directory and can optionally serve it with --serve-dashboard
-- Added an improved terminal progress UI showing completed jobs / total jobs and counts of hosts/ports/services.
+  # Discovery-only (skip aggressive/service follow-ups):
+  python3 nmapPyDumpPlus_with_scanner.py --targets-file targets.txt --outputDir ./pyDumpOutput --discovery-only
 
-Notes:
- - Requires system `nmap` binary.
- - To view dashboard in a browser, either open outputDir/web.html or run with --serve-dashboard.
+  # Include OS detection in aggressive TCP scan (adds -O):
+  python3 nmapPyDumpPlus_with_scanner.py --targets-file targets.txt --outputDir ./pyDumpOutput --include-os
 
+  # Tweak UDP retry/backoff behavior (default: delay=0.5s, backoff=2.0x, retries=2):
+  python3 nmapPyDumpPlus_with_scanner.py --targets-file targets.txt --outputDir ./pyDumpOutput --udp-delay 1.0 --udp-backoff 3.0 --udp-retries 3
 """
 
 import argparse
@@ -23,6 +23,7 @@ import datetime
 import multiprocessing
 import json
 import threading
+import time
 import http.server
 import socketserver
 from pathlib import Path
@@ -31,7 +32,8 @@ import ipaddress
 import xml.etree.ElementTree as ET
 import html
 
-includeTcpwrapped = False 
+includeTcpwrapped = False
+
 
 def sanitize_filename(filename):
     return "".join(c if c.isalnum() or c in ('_', '-') else '_' for c in filename)
@@ -82,14 +84,12 @@ def load_state(state_file):
 
 
 def save_state(state, state_file):
-    # Ensure sets/lists are serializable
-    out = dict(state)
+    out = _to_serializable(state)
     with open(state_file, 'w') as f:
         json.dump(out, f)
 
 
 def _to_sets(state):
-    # Convert lists into sets for runtime convenience
     state['http_urls'] = set(state.get('http_urls', []))
     state['https_urls'] = set(state.get('https_urls', []))
     state['ips_listed'] = set(state.get('ips_listed', []))
@@ -98,15 +98,15 @@ def _to_sets(state):
         state.setdefault(key, {})
         for k, v in list(state[key].items()):
             state[key][k] = set(v) if isinstance(v, list) else set(v)
-    state.setdefault('up_seen', set(state.get('up_seen', [])))
+    state['up_seen'] = set(state.get('up_seen', []))
 
 
 def _to_serializable(state):
     s = dict(state)
-    s['http_urls'] = list(s['http_urls'])
-    s['https_urls'] = list(s['https_urls'])
-    s['ips_listed'] = list(s['ips_listed'])
-    s['hostnames_listed'] = list(s['hostnames_listed'])
+    s['http_urls'] = list(s.get('http_urls', []))
+    s['https_urls'] = list(s.get('https_urls', []))
+    s['ips_listed'] = list(s.get('ips_listed', []))
+    s['hostnames_listed'] = list(s.get('hostnames_listed', []))
     for key in ('ports_seen', 'services_seen', 'versions_seen', 'services_with_ports_seen', 'ports_csv_seen'):
         new = {}
         for k, v in s.get(key, {}).items():
@@ -244,7 +244,6 @@ def append_web_entries(host, output_dir, state):
     total_url_hostname_list = os.path.join(web_html_dir, 'total.url.hostname.list')
     total_url_ip_list = os.path.join(web_html_dir, 'total.url.ip.list')
 
-    # create header if missing
     if not os.path.exists(parsed_web_servers_html):
         with open(parsed_web_servers_html, 'w') as html_file:
             html_file.write("""<!DOCTYPE html><html><head><meta charset=\"utf-8\"><style>table{width:100%;border-collapse:collapse}td,th{border:1px solid #ccc;padding:6px}</style></head><body><h2>Parsed Web Servers</h2><table><thead><tr><td>IP Address</td><td>Links</td><td>Port</td><td>Service Info</td></tr></thead><tbody>""")
@@ -371,36 +370,11 @@ def write_dashboard(output_dir, state):
         f.write(html_content)
 
 
-# ---------------------- Nmap invocation ----------------------
-
-def build_nmap_command(targets, scan_type, xml_output_path, extra_args=None):
-    base = ["nmap", "-oX", xml_output_path]
-    extra = extra_args or []
-
-    if scan_type == 'quick':
-        base += ['-T4', '-F']
-    elif scan_type == 'full':
-        base += ['-p-', '-T4', '-sV', '-sC']
-    elif scan_type == 'aggressive':
-        base += ['-A', '-p-']
-    elif scan_type == 'udp':
-        base += ['-sU', '--top-ports=100']
-
-    base += extra
-
-    if isinstance(targets, (list, tuple)):
-        base += targets
-    else:
-        if os.path.exists(targets):
-            base = base + ['-iL', targets]
-        else:
-            base = base + [targets]
-
-    return base
-
+# ---------------------- Nmap invocation helpers ----------------------
 
 def run_nmap_subprocess(cmd, timeout=None):
     try:
+        print('Running:', ' '.join(cmd))
         completed = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
         if completed.returncode != 0:
             print(f"nmap exited with code {completed.returncode}. stderr:\n{completed.stderr.decode(errors='ignore')}")
@@ -413,14 +387,127 @@ def run_nmap_subprocess(cmd, timeout=None):
         sys.exit(1)
 
 
-# ---------------------- Scanning orchestration (append-only, default live updates) ----------------------
+# ---------------------- Staged scan builders ----------------------
 
-def run_scans(targets_arg, output_dir, scans, parallel=1, extra_args=None, serve_dashboard=False):
+def build_tcp_discovery_cmd(target, xml_out, extra_args):
+    base = ["nmap", "-oX", xml_out, "-p-", "-T4", "-sS"]
+    base += extra_args or []
+    if os.path.exists(target):
+        base += ['-iL', target]
+    else:
+        base.append(target)
+    return base
+
+
+def build_tcp_aggressive_cmd(target, ports, xml_out, extra_args, include_os=False):
+    # aggressive: -T4 -sC -sV -A plus -p <ports>
+    base = ["nmap", "-oX", xml_out, "-T4", "-sC", "-sV", "-A", "-p", ports]
+    if include_os:
+        base.insert(4, '-O')  # insert -O after -T4 for readability; order not critical
+    base += extra_args or []
+    if os.path.exists(target):
+        base += ['-iL', target]
+    else:
+        base.append(target)
+    return base
+
+
+def build_udp_discovery_cmd(target, xml_out, extra_args):
+    base = ["nmap", "-oX", xml_out, "-sU", "-p-", "-T3"]
+    base += extra_args or []
+    if os.path.exists(target):
+        base += ['-iL', target]
+    else:
+        base.append(target)
+    return base
+
+
+def build_udp_service_cmd(target, ports, xml_out, extra_args):
+    base = ["nmap", "-oX", xml_out, "-sU", "-sV", "-p", ports, "-T3"]
+    base += extra_args or []
+    if os.path.exists(target):
+        base += ['-iL', target]
+    else:
+        base.append(target)
+    return base
+
+
+# ---------------------- Staged scanning for a single target (with UDP backoff) ----------------------
+
+def run_target_staged(target, output_dir, extra_args=None, discovery_only=False, udp_delay=0.5, udp_backoff=2.0, udp_retries=2, include_os=False):
+    xml_out_dir = os.path.join(output_dir, 'nmap_xml')
+    os.makedirs(xml_out_dir, exist_ok=True)
+    ts = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+
+    created = []
+
+    # 1) TCP discovery (full port) - always run
+    tcp_disc_xml = os.path.join(xml_out_dir, f"nmap_{ts}_tcp_discovery.xml")
+    cmd = build_tcp_discovery_cmd(target, tcp_disc_xml, extra_args)
+    rc = run_nmap_subprocess(cmd)
+    if rc == 0 and os.path.exists(tcp_disc_xml):
+        created.append(tcp_disc_xml)
+        hosts = parse_nmap_xml([tcp_disc_xml])
+        discovered_tcp_ports = []
+        for h in hosts:
+            discovered_tcp_ports.extend(h.ports)
+    else:
+        discovered_tcp_ports = []
+
+    # If discovery-only, skip follow-up
+    if not discovery_only and discovered_tcp_ports:
+        # 2) TCP aggressive/service scan on discovered ports
+        ports_csv = ','.join(sorted(set(discovered_tcp_ports), key=lambda x: int(x)))
+        tcp_aggr_xml = os.path.join(xml_out_dir, f"nmap_{ts}_tcp_aggressive.xml")
+        cmd2 = build_tcp_aggressive_cmd(target, ports_csv, tcp_aggr_xml, extra_args, include_os=include_os)
+        rc2 = run_nmap_subprocess(cmd2)
+        if rc2 == 0 and os.path.exists(tcp_aggr_xml):
+            created.append(tcp_aggr_xml)
+
+    # 3) UDP discovery (full port) - always run
+    udp_disc_xml = os.path.join(xml_out_dir, f"nmap_{ts}_udp_discovery.xml")
+    cmd3 = build_udp_discovery_cmd(target, udp_disc_xml, extra_args)
+    rc3 = run_nmap_subprocess(cmd3)
+    discovered_udp_ports = []
+    if rc3 == 0 and os.path.exists(udp_disc_xml):
+        created.append(udp_disc_xml)
+        hosts_u = parse_nmap_xml([udp_disc_xml])
+        for h in hosts_u:
+            discovered_udp_ports.extend(h.ports)
+
+    # 4) UDP service/version scan on discovered UDP ports (if any)
+    if not discovery_only and discovered_udp_ports:
+        ports_csv_u = ','.join(sorted(set(discovered_udp_ports), key=lambda x: int(x)))
+        udp_service_xml = os.path.join(xml_out_dir, f"nmap_{ts}_udp_service.xml")
+        # attempt with retries/backoff to reduce false negatives
+        attempt = 0
+        delay = udp_delay
+        success = False
+        while attempt <= udp_retries and not success:
+            cmd4 = build_udp_service_cmd(target, ports_csv_u, udp_service_xml, extra_args)
+            rc4 = run_nmap_subprocess(cmd4)
+            if rc4 == 0 and os.path.exists(udp_service_xml):
+                created.append(udp_service_xml)
+                success = True
+                break
+            attempt += 1
+            if attempt <= udp_retries:
+                print(f"UDP service scan attempt {attempt} failed or produced no result, sleeping {delay}s before retry")
+                time.sleep(delay)
+                delay *= udp_backoff
+
+    return created
+
+
+# ---------------------- Orchestration across targets ----------------------
+
+def run_scans(targets_arg, output_dir, parallel=1, extra_args=None, serve_dashboard=False, discovery_only=False, udp_delay=0.5, udp_backoff=2.0, udp_retries=2, include_os=False):
     xml_out_dir = os.path.join(output_dir, 'nmap_xml')
     os.makedirs(xml_out_dir, exist_ok=True)
 
     if isinstance(targets_arg, str) and os.path.exists(targets_arg):
-        targets_list = [targets_arg]
+        with open(targets_arg, 'r') as f:
+            targets_list = [l.strip() for l in f if l.strip()]
     elif isinstance(targets_arg, str) and ',' in targets_arg:
         targets_list = [t.strip() for t in targets_arg.split(',') if t.strip()]
     elif isinstance(targets_arg, (list, tuple)):
@@ -428,25 +515,13 @@ def run_scans(targets_arg, output_dir, scans, parallel=1, extra_args=None, serve
     else:
         targets_list = [targets_arg]
 
-    jobs = []
-    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-
-    for i, t in enumerate(targets_list):
-        for scan in scans:
-            xml_name = f"nmap_{timestamp}_{i}_{scan}.xml"
-            xml_path = os.path.join(xml_out_dir, xml_name)
-            cmd = build_nmap_command(t, scan, xml_path, extra_args=extra_args)
-            jobs.append((cmd, xml_path))
-
-    total_jobs = len(jobs)
+    total_jobs = len(targets_list)
     completed_jobs = 0
 
-    # state
     state_file = os.path.join(output_dir, 'state.json')
     state = load_state(state_file)
     _to_sets(state)
 
-    # Optionally start a simple static file server for the dashboard
     server_thread = None
     if serve_dashboard:
         def serve():
@@ -458,13 +533,11 @@ def run_scans(targets_arg, output_dir, scans, parallel=1, extra_args=None, serve
         server_thread = threading.Thread(target=serve, daemon=True)
         server_thread.start()
 
-    def worker(job):
+    def worker_target(t):
         nonlocal completed_jobs
-        cmd, xml_path = job
-        rc = run_nmap_subprocess(cmd)
-        if rc == 0 and os.path.exists(xml_path):
-            # parse and append-only update
-            new_hosts = parse_nmap_xml([xml_path])
+        created_xmls = run_target_staged(t, output_dir, extra_args=extra_args, discovery_only=discovery_only, udp_delay=udp_delay, udp_backoff=udp_backoff, udp_retries=udp_retries, include_os=include_os)
+        for xml in created_xmls:
+            new_hosts = parse_nmap_xml([xml])
             for nh in new_hosts:
                 existing = state['hosts'].get(nh.address)
                 if not existing:
@@ -491,19 +564,11 @@ def run_scans(targets_arg, output_dir, scans, parallel=1, extra_args=None, serve
                         append_web_entries(nh, output_dir, state)
                         append_csvs_and_lists(nh, output_dir, state)
 
-            # update sets for lists and urls
-            state['ips_listed'].update([ip for ip in state['hosts'].keys()])
-            for k in ('http_urls','https_urls'):
-                state[k] = state[k]
-
-            # save state
-            save_state(_to_serializable(state), state_file)
-
-            # update dashboard
-            write_dashboard(output_dir, state)
+        state['ips_listed'].update([ip for ip in state['hosts'].keys()])
+        save_state(state, state_file)
+        write_dashboard(output_dir, state)
 
         completed_jobs += 1
-        # progress UI (no ETA)
         total_hosts = len(state['hosts'])
         total_ports = sum(len(set(h.get('ports', []))) for h in state['hosts'].values())
         total_services = sum(len(h.get('services', [])) for h in state['hosts'].values())
@@ -512,15 +577,14 @@ def run_scans(targets_arg, output_dir, scans, parallel=1, extra_args=None, serve
 
     if parallel and parallel > 1:
         with multiprocessing.Pool(processes=parallel) as pool:
-            pool.map(worker, jobs)
+            pool.map(worker_target, targets_list)
     else:
-        for job in jobs:
-            worker(job)
+        for t in targets_list:
+            worker_target(t)
 
-    # finalize dashboard HTML
     finalize_html(os.path.join(output_dir, 'webHTML', 'parsedWebServers.html'))
     write_dashboard(output_dir, state)
-    save_state(_to_serializable(state), state_file)
+    save_state(state, state_file)
 
     print(f"Scans complete. XML files in {os.path.join(output_dir, 'nmap_xml')}")
 
@@ -537,7 +601,6 @@ def rebuild_from_xml(output_dir):
         print('No XML files to rebuild from.')
         return
 
-    # reset outputs
     for d in ('ports', 'services', 'versions', 'servicesWithPorts', 'webHTML'):
         path = os.path.join(output_dir, d)
         if os.path.isdir(path):
@@ -547,12 +610,20 @@ def rebuild_from_xml(output_dir):
                 except Exception:
                     pass
 
-    # rebuild from scratch
     hosts = parse_nmap_xml(xml_files)
-    # rebuild state object
-    state = load_state(os.path.join(output_dir, 'state.json'))
-    # reset
-    state = load_state('/dev/null') if os.name != 'nt' else load_state(os.path.join(output_dir, 'state.json'))
+    state = {
+        'hosts': {},
+        'ports_seen': {},
+        'services_seen': {},
+        'versions_seen': {},
+        'services_with_ports_seen': {},
+        'http_urls': [],
+        'https_urls': [],
+        'ips_listed': [],
+        'hostnames_listed': [],
+        'ports_csv_seen': {},
+        'up_seen': []
+    }
     _to_sets(state)
 
     for h in hosts:
@@ -568,7 +639,7 @@ def rebuild_from_xml(output_dir):
 
     finalize_html(os.path.join(output_dir, 'webHTML', 'parsedWebServers.html'))
     write_dashboard(output_dir, state)
-    save_state(_to_serializable(state), os.path.join(output_dir, 'state.json'))
+    save_state(state, os.path.join(output_dir, 'state.json'))
     print('Rebuild complete.')
 
 
@@ -582,23 +653,26 @@ def create_directory_structure(output_dir):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='nmapperUltra with append-only live updates and dashboard')
+    parser = argparse.ArgumentParser(description='nmapPyDumpPlus with staged scans (full-port discovery then targeted scans)')
     parser.add_argument('--targets-file', help='Path to file with targets (one per line) OR a single target string.')
     parser.add_argument('--targets', help='Comma-separated target list, e.g. 10.0.0.1,10.0.0.2')
     parser.add_argument('--outputDir', default='pyDumpOutput', help='Output directory')
-    parser.add_argument('--scans', default='quick,full,udp', help='Comma separated scan types. Allowed: quick,full,aggressive,udp')
-    parser.add_argument('--parallel', type=int, default=1, help='Number of parallel nmap workers')
+    parser.add_argument('--parallel', type=int, default=1, help='Number of parallel target workers')
     parser.add_argument('--only-scan', action='store_true', help='Only run scans, do not build reports (still create XMLs)')
     parser.add_argument('--extra-nmap-args', help='Additional space-separated args for nmap (wrap in quotes)')
     parser.add_argument('--rebuild', action='store_true', help='Force full rebuild from all XMLs in outputDir/nmap_xml')
     parser.add_argument('--serve-dashboard', action='store_true', help='Serve the outputDir over HTTP on port 8000 for dashboard viewing')
+    parser.add_argument('--discovery-only', action='store_true', help='Run discovery stages only (skip aggressive/service follow-ups)')
+    parser.add_argument('--udp-delay', type=float, default=0.5, help='Initial delay (seconds) before retrying UDP service scan')
+    parser.add_argument('--udp-backoff', type=float, default=2.0, help='Backoff multiplier for UDP retry delay')
+    parser.add_argument('--udp-retries', type=int, default=2, help='Number of retries for UDP service scan on failure')
+    parser.add_argument('--include-os', action='store_true', help='Include OS detection (-O) in aggressive TCP scan')
 
     args = parser.parse_args()
 
     output_dir = args.outputDir
     create_directory_structure(output_dir)
 
-    scans = [s.strip() for s in args.scans.split(',') if s.strip()]
     extra_args = args.extra_nmap_args.split() if args.extra_nmap_args else []
 
     if args.rebuild:
@@ -610,7 +684,16 @@ def main():
         print('No targets provided. Use --targets-file or --targets')
         sys.exit(1)
 
-    run_scans(targets_arg, output_dir, scans, parallel=args.parallel, extra_args=extra_args, serve_dashboard=args.serve_dashboard)
+    run_scans(targets_arg,
+              output_dir,
+              parallel=args.parallel,
+              extra_args=extra_args,
+              serve_dashboard=args.serve_dashboard,
+              discovery_only=args.discovery_only,
+              udp_delay=args.udp_delay,
+              udp_backoff=args.udp_backoff,
+              udp_retries=args.udp_retries,
+              include_os=args.include_os)
 
     if args.only_scan:
         print('Scan phase complete. XML outputs are in', os.path.join(output_dir, 'nmap_xml'))
