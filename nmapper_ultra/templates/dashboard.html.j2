@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Nmap Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.6/css/jquery.dataTables.min.css">
+  <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body { font-family: system-ui; margin: 2rem; background: #f4f4f4; }
+    table { width: 100%; background: white; }
+    th { background: #333; color: white; }
+    .chart-container { width: 400px; display: inline-block; margin: 1rem; }
+  </style>
+</head>
+<body>
+  <h1>Nmap Scan Dashboard</h1>
+  <table id="hosts" class="display">
+    <thead>
+      <tr><th>IP</th><th>Hostname</th><th>Ports</th><th>Services</th><th>OS</th></tr>
+    </thead>
+    <tbody>
+      {% for h in hosts %}
+      <tr>
+        <td>{{ h.ip }}</td>
+        <td>{{ h.hostname }}</td>
+        <td>{{ h.ports | map(attribute='port') | join(', ') }}</td>
+        <td>{{ h.ports | map(attribute='service') | join(', ') }}</td>
+        <td>{{ h.os }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+  <div class="chart-container">
+    <canvas id="serviceChart"></canvas>
+  </div>
+
+  <script>
+    $(document).ready(function(){ $('#hosts').DataTable(); });
+
+    const svcCtx = document.getElementById('serviceChart').getContext('2d');
+    const services = [...new Set([].concat(...{{ hosts | map(attribute='ports') | list | tojson }}.map(p => p.service)))];
+    const counts = services.map(s => {{ hosts }}.flatMap(h => h.ports).filter(p => p.service === s).length);
+    new Chart(svcCtx, {
+      type: 'doughnut',
+      data: { labels: services, datasets: [{ data: counts, backgroundColor: ['#ff6384','#36a2eb','#ffce56','#4bc0c0','#9966ff'] }] }
+    });
+  </script>
+</body>
+</html>
