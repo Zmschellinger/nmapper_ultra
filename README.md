@@ -1,244 +1,213 @@
-# `nmap_ultra_enhanced.py` – Advanced Nmap Automation & Reporting
+# `nmapper-ultra` – Advanced Nmap Automation & Reporting
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)  
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)  
 
-**A powerful, resumable, parallel Nmap scanner with rich HTML dashboards, state persistence, and optional screenshot/Nuclei integration.**
+> **A powerful, resumable, parallel Nmap scanner with live HTML dashboards, state persistence, and automatic result organization — built for pentesters and security researchers.**
 
 ---
 
 ## Features
 
 | Feature | Description |
-|-------|-----------|
-| **Staged Scanning** | Full-port discovery → targeted aggressive scans |
-| **Parallel Execution** | Scan multiple targets simultaneously |
-| **Incremental & Resumable** | `state.json` tracks progress; skip already-scanned hosts |
-| **Rich HTML Dashboard** | Live-updating `dashboard.html` with host/port/service summary |
-| **Web Server Aggregation** | Auto-collects HTTP/HTTPS URLs with clickable links |
-| **CSV + TXT Outputs** | Per-port, per-service, per-version files |
-| **UDP Retry Logic** | Exponential backoff for unreliable UDP scans |
-| **Parallel XML Parsing** | Fast processing of large scan results |
-| **Live HTTP Server** | `--serve-dashboard` to view results in browser |
-| **Screenshots** | `--screenshots` → `gowitness` on discovered web servers |
-| **Nuclei Integration** | `--nuclei` → run vulnerability scan on web URLs |
-| **Scope Control** | `--scope-file` ensures you only scan authorized targets |
-| **Legal Banner** | Reminds users of ethical use |
-| **Type-Safe & Clean** | Full type hints, `mypy`-clean, `pathlib`, `rich` logging |
+|---------|-------------|
+| **Parallel Scanning** | Scan hundreds of targets simultaneously (up to 64 threads) |
+| **Resumable Scans** | `state.json` tracks completed hosts; skip already-scanned IPs |
+| **Live HTML Dashboard** | Auto-refreshing `dashboard.html` with search, filters, and charts |
+| **Web Server Detection** | Auto-collects HTTP/HTTPS URLs with clickable links |
+| **Protocol-Specific Scans** | HTTP, HTTPS, SSH, SMB, RDP, WinRM, FTP, MySQL, PostgreSQL, VNC, or all ports |
+| **UDP Retry Logic** | Exponential backoff for reliable UDP scans |
+| **Parallel XML Parsing** | Fast processing using `lxml` + `ProcessPoolExecutor` |
+| **CIDR & Range Support** | Supports `192.168.1.0/24`, `10.0.0.1-10.0.0.254`, etc. |
+| **External Tools** | Optional `gowitness` screenshots and `nuclei` vuln scans (skips if tools missing) |
+| **Modern CLI** | Powered by [Typer](https://typer.tiangolo.com/) with auto-completion |
 
 ---
 
 ## Output Structure
 
-```
-pyDumpOutput/
+```text
+results/
 ├── nmap_xml/                  # Raw Nmap XML files
 ├── ports/
-│   ├── 80                     # IPs with HTTP
-│   └── 22                     # IPs with SSH
+│   ├── 80/                    # IPs with port 80 open
+│   ├── 445/                   # IPs with SMB open
+│   └── ...                    # One folder per open port
 ├── services/
-│   ├── http                   # IP:port lines
-│   └── ssh
+│   ├── http/                  # IP:port for HTTP services
+│   ├── ssh/                   # IP:port for SSH services
+│   └── ...                    # One folder per service
 ├── versions/
-│   └── Apache_2.4.41          # IPs running that version
+│   └── Apache_2.4.41/         # IPs running specific versions
 ├── servicesWithPorts/
-│   └── http_80                # IPs with HTTP on port 80
+│   └── http_80/               # IPs with HTTP on port 80
 ├── webHTML/
-│   ├── dashboard.html         # Summary table
+│   ├── dashboard.html         # Live-updating table + charts
 │   ├── parsedWebServers.html  # Clickable web links
-│   ├── http.url.list
-│   ├── https.url.list
-│   └── screenshots/           # gowitness output
-├── nuclei/
-│   └── results.txt            # Nuclei scan results
-├── all.ports.up.csv           # IP,hostname,port
-├── all.up.csv                 # IP,hostname
-├── ips.up.list
-├── hostnames.up.list
-└── state.json                 # Persistent deduplication state
+│   ├── http.url.list          # List of HTTP URLs
+│   └── https.url.list         # List of HTTPS URLs
+├── screenshots/               # gowitness screenshots (if enabled)
+├── all.ports.up.csv           # CSV: IP,hostname,port
+├── all.up.csv                 # CSV: IP,hostname
+├── ips.up.list                # List of up IPs
+├── hostnames.up.list          # List of hostnames
+└── state.json                 # Scan state for resuming
 ```
 
 ---
 
-## Installation
+## Installation (Kali Linux)
 
-### 1. Clone & Install Python Dependencies
+### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/yourname/nmap-ultra-enhanced.git
-cd nmap-ultra-enhanced
-pip install rich tqdm
+git clone https://github.com/yourname/nmapper-ultra.git ~/tools/dev/nmapper_ultra
+cd ~/tools/dev/nmapper_ultra
 ```
 
-### 2. Install `nmap`
+### 2. Set Up Virtual Environment
 
 ```bash
-# Ubuntu/Debian
-sudo apt install nmap
-
-# macOS
-brew install nmap
-
-# Kali Linux
-sudo apt install nmap
+python3 -m venv nmapper-env
+source nmapper-env/bin/activate
 ```
 
-### 3. (Optional) Install `gowitness` for Screenshots
+### 3. Install Dependencies
 
 ```bash
+pip install --upgrade pip setuptools wheel
+pip install -e .
+```
+
+### 4. Install System Dependencies
+
+```bash
+sudo apt update
+sudo apt install -y nmap python3-lxml
+```
+
+### 5. (Optional) Install External Tools
+
+```bash
+# gowitness (screenshots)
 go install github.com/sensepost/gowitness@latest
-# Or download prebuilt: https://github.com/sensepost/gowitness/releases
-```
+sudo cp ~/go/bin/gowitness /usr/local/bin/
 
-### 4. (Optional) Install `nuclei`
-
-```bash
-go install -v github.com/projectdiscovery/nuclei/v2/cmd/nuclei@latest
+# nuclei (vulnerability scanning)
+sudo apt install -y nuclei
 nuclei -update-templates
 ```
 
 ---
 
-## Usage
-
-### Basic Scan
+### Basic Scans
 
 ```bash
-python3 nmap_ultra_enhanced.py \
-  --targets-file targets.txt \
-  --outputDir results \
-  --parallel 8
+nmapper-ultra --targets-file scope.txt --outputDir ./results
 ```
 
-### Discovery Only (Faster)
+### Full Scan (All Ports)
 
 ```bash
-python3 nmap_ultra_enhanced.py \
-  --targets 10.0.0.0/24 \
-  --discovery-only
+nmapper-ultra 192.168.216.0/24 --parallel 16 --serve-dashboard
 ```
 
-### With OS Detection + UDP Retries
-
-```bash
-python3 nmap_ultra_enhanced.py \
-  --targets-file targets.txt \
-  --include-os \
-  --udp-retries 3 \
-  --udp-backoff 3.0
-```
-
-### Skip Already-Scanned Hosts
-
-```bash
-python3 nmap_ultra_enhanced.py \
-  --targets-file new_targets.txt \
-  --skip-known-up
-```
-
-### Scope Enforcement
-
-```bash
-# scope.txt
-10.10.10.0/24
-192.168.1.100
-
-python3 nmap_ultra_enhanced.py \
-  --targets-file targets.txt \
-  --scope-file scope.txt
-```
-
-### Full Recon Pipeline (Screenshots + Nuclei)
-
-```bash
-python3 nmap_ultra_enhanced.py \
-  --targets-file targets.txt \
-  --screenshots \
-  --nuclei \
-  --serve-dashboard
-```
-
-> Open browser: [http://localhost:8000/webHTML/dashboard.html](http://localhost:8000/webHTML/dashboard.html)
-
----
-
-## CLI Options
-
-| Option | Description |
-|------|-------------|
-| `--targets-file` | File with one target per line |
-| `--targets` | Comma-separated targets |
-| `--outputDir` | Output directory (default: `pyDumpOutput`) |
-| `--parallel` | Number of parallel workers |
-| `--discovery-only` | Skip aggressive/service scans |
-| `--include-os` | Add `-O` to aggressive TCP scan |
-| `--udp-delay/backoff/retries` | UDP retry behavior |
-| `--skip-known-up` | Skip hosts already in `state.json` |
-| `--scope-file` | File with allowed IPs/CIDRs |
-| `--screenshots` | Run `gowitness` on web URLs |
-| `--nuclei` | Run `nuclei` on web URLs |
-| `--serve-dashboard` | Start HTTP server on port 8000 |
-| `--rebuild` | Rebuild reports from existing XMLs |
-| `--extra-nmap-args` | Pass extra args to nmap (quoted) |
-
----
-
-## Example `targets.txt`
+### Options
 
 ```text
-10.10.10.0/24
-192.168.1.1
-example.com
-scanme.nmap.org
+Arguments:
+  TARGETS           CIDR, IP, or range (e.g., 192.168.1.0/24, 10.0.0.1-10.0.0.254)
+
+Options:
+  -tf, --targets-file PATH  File with one target per line
+  -o, --outputDir PATH      Output directory [default: pyDumpOutput]
+  -t, --parallel INT        Parallel threads (1–64) [default: 8]
+  -O, --include-os          Enable OS detection
+  --extra-nmap-args LIST    Extra nmap args (e.g., "--script vuln")
+  --screenshots             Take screenshots with gowitness
+  --nuclei                  Run Nuclei on HTTP/HTTPS
+  --serve-dashboard         Serve live dashboard at http://127.0.0.1:8000
 ```
 
 ---
 
-## Rebuilding Reports
-
-If you have old XMLs and want fresh reports:
+## Example Output
 
 ```bash
-python3 nmap_ultra_enhanced.py --outputDir results --rebuild
+$ nmapper-ultra 192.168.216.0/24 --screenshots --nuclei
+Running: nmap -sV -sC -p 80,443,8080,8443 -oX results/nmap_xml/192.168.216.189.xml ...
+Scan completed: 192.168.216.189
+...
+Scanning: 100%|██████████| 256/256 [02:15<00:00, 1.9host/s]
+Parsing XML: 100%|██████████| 12/12 [00:02<00:00, 5.1file/s]
+[green]Parsed 12 hosts[/green]
+[green]Dashboard: http://127.0.0.1:8000/dashboard.html[/green]
 ```
 
 ---
 
-## Legal & Ethical Use
+## Live Dashboard
 
-> **WARNING: Only scan systems you own or have explicit written permission to test.**
-
-This tool includes:
-- A **legal banner** on every run
-- **Scope enforcement** via `--scope-file`
-- No default stealth options
-
-Unauthorized scanning may violate laws like the CFAA (US), Computer Misuse Act (UK), etc.
+- **Auto-refreshes**: Every 10 seconds
+- **Search & filter**: By IP, port, service, or OS
+- **Doughnut chart**: Top services (HTTP, SSH, etc.)
+- **Dark mode**: Matches system theme
+- **Clickable links**: Open web servers in browser
 
 ---
 
-## Contributing
+## Development
 
-1. Fork it
-2. Create your feature branch (`git checkout -b feature/amazing`)
-3. Commit (`git commit -am 'Add amazing feature'`)
-4. Push (`git push origin feature/amazing`)
-5. Open a Pull Request
+### Install for Development
+
+```bash
+pip install -e .[test]
+```
+
+### Run Tests
+
+```bash
+pytest -v
+```
+
+### Format Code
+
+```bash
+pip install black ruff isort
+black .
+ruff check .
+isort .
+```
+
+---
+
+## Security & Legal
+
+> **Only scan systems you own or have explicit permission to test.**
+
+- **Safe defaults**: No aggressive scripts
+- **Secure parsing**: Sanitized `--extra-nmap-args`
+- **Redaction-ready**: No credentials stored in output
 
 ---
 
 ## License
 
-[MIT License](LICENSE) – Free to use, modify, and distribute.
+[MIT License](LICENSE) – Free for commercial and personal use.
 
 ---
 
-## Author
+## Built With
 
-**Zachary Schellinger** – Security Researcher / Pentester
+- [Typer](https://typer.tiangolo.com/) – CLI framework
+- [Rich](https://github.com/Textualize/rich) – Terminal output
+- [Jinja2](https://jinja.palletsprojects.com/) – HTML templates
+- [lxml](https://lxml.de/) – XML parsing
+- [netaddr](https://github.com/netaddr/netaddr) – CIDR expansion
+- [tqdm](https://github.com/tqdm/tqdm) – Progress bars
 
 ---
 
-**Fast. Smart. Beautiful. Ethical.**
+**Star this repo if it helped you!**
 
-> *“Stay hungry, stay foolish.” -Steve Jobs*
+---
